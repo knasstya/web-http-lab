@@ -2,6 +2,16 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 
+import os
+from dotenv import load_dotenv
+import psycopg
+
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+def get_connection():
+    return psycopg.connect(DATABASE_URL)
+
 app = FastAPI(title="Notes API", version="0.1.0")
 
 @app.get("/health")
@@ -20,46 +30,95 @@ class NoteUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=80)
     content: str | None = Field(default=None, min_length=1, max_length=500)
 
-notes = []
-next_id = 1
-
 @app.get("/notes")
 def get_notes():
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM notes")
+            rows = cursor.fetchall()
+
+            notes = []
+
+            for row in rows:
+                id = row[0]
+                title = row[1]
+                content = row[2]
+
+                note = {
+                    "id": id,
+                    "title": title,
+                    "content": content
+                }
+
+                notes.append(note)
+
     return notes
 
 
 @app.post("/notes", status_code=201)
 def create_note(note: NoteCreate):
-    global next_id
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO notes (title, content)
+                VALUES (%s, %s)
+                RETURNING id, title, content
+                """,
+                (note.title, note.content)
+            )
+            row = cursor.fetchone()
 
-    note_id = next_id
-    next_id = note_id + 1
-
-    new_note = {
-        "id": note_id,
-        "title": note.title,
-        "content": note.content
+    return {
+        "id": row[0],
+        "title": row[1],
+        "content": row[2]
     }
-
-    notes.append(new_note)
-    return new_note
 
 @app.get("/notes/{note_id}")
 def get_note(note_id: int):
-    for note in notes:
-        if note["id"] == note_id:
-            return note
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, title, content
+                FROM notes
+                WHERE id = %s
+                """,
+                (note_id,)
+            )
 
-    raise HTTPException(status_code=404, detail="Note not found")
+            row = cursor.fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+
+    return {
+        "id": row[0],
+        "title": row[1],
+        "content": row[2]
+    }
 
 @app.head("/notes/{note_id}")
 def head_note(note_id: int):
-    for note in notes:
-        if note["id"] == note_id:
-            return Response(
-                status_code=200,
-                headers={"x-note-exists": "true"}
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM notes
+                WHERE id = %s
+                """,
+                (note_id,)
             )
+
+            row = cursor.fetchone()
+
+    if row is not None:
+        return Response(
+            status_code=200,
+            headers={"x-note-exists": "true"}
+        )
 
     return Response(
         status_code=404,
@@ -68,21 +127,45 @@ def head_note(note_id: int):
 
 @app.patch("/notes/{note_id}")
 def update_note(note_id: int, note: NoteUpdate):
-    for idx, existing_note in enumerate(notes):
-        if existing_note["id"] == note_id:
-            if note.title is not None:
-                notes[idx]["title"] = note.title
-            if note.content is not None:
-                notes[idx]["content"] = note.content
-            return notes[idx]
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE notes
+                SET title = COALESCE(%s, title),
+                    content = COALESCE(%s, content)
+                WHERE id = %s
+                RETURNING id, title, content
+                """,
+                (note.title, note.content, note_id)
+            )
 
-    raise HTTPException(status_code=404, detail="Note not found")
+            row = cursor.fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+
+    return {
+        "id": row[0],
+        "title": row[1],
+        "content": row[2]
+    }
 
 @app.delete("/notes/{note_id}")
 def delete_note(note_id: int):
-    for idx, note in enumerate(notes):
-        if note["id"] == note_id:
-            del notes[idx]
-            return Response(status_code=204)
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM notes
+                WHERE id = %s
+                """,
+                (note_id,)
+            )
 
-    raise HTTPException(status_code=404, detail="Note not found")
+            deleted_count = cursor.rowcount
+
+    if deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Note not found")
+
+    return Response(status_code=204)
